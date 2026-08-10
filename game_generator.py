@@ -227,6 +227,117 @@ class GameGenerator:
         
         return runs, batter_idx
     
+    def get_re24_value(self, bases: List[int], outs: int) -> float:
+        """Returns RE24 run expectancy for current base state and outs"""
+        if outs >= 3:
+            return 0.0
+        base_tuple = (int(bases[0]), int(bases[1]), int(bases[2]))
+        try:
+            state_idx = self.base_states.index(base_tuple)
+            return float(self.base_matrix[state_idx][outs])
+        except (ValueError, IndexError):
+            return 0.0
+
+    def simulate_game_pbp(self, lineup: LineupModel, game_id: str = "Game_0001", innings: int = 9) -> Tuple[int, List[Dict[str, Any]]]:
+        """
+        Simulate a complete game and return total runs + play-by-play (PBP) events for RNN/LSTM sequence modeling
+        """
+        total_runs = 0
+        pbp_events = []
+        batter_idx = 0
+
+        for inning in range(1, innings + 1):
+            outs = 0
+            bases = [0, 0, 0]
+            prev_player = None
+            prev_outcome = "start_inning"
+
+            while outs < 3:
+                l_pos = (batter_idx % len(lineup.lineup_order)) + 1
+                p_name = lineup.lineup_order[l_pos - 1]
+                player = lineup.get_player_by_name(p_name)
+
+                if player is None:
+                    outs += 1
+                    batter_idx += 1
+                    continue
+
+                re_start = self.get_re24_value(bases, outs)
+                pre_bases = (int(bases[0]), int(bases[1]), int(bases[2]))
+                pre_outs = outs
+
+                outcome = self.simulate_at_bat(player)
+                new_bases, new_outs, runs = self.update_game_state(bases, outs, outcome, player)
+                total_runs += runs
+                re_end = self.get_re24_value(new_bases, new_outs)
+
+                run_value_re24 = (re_end - re_start) + runs
+
+                event = {
+                    'Game ID': game_id,
+                    'Inning': inning,
+                    'Batter': player.name,
+                    'Lineup Position': l_pos,
+                    'Pre-AB Bases': pre_bases,
+                    'Pre-AB Outs': pre_outs,
+                    'on_1b': pre_bases[0],
+                    'on_2b': pre_bases[1],
+                    'on_3b': pre_bases[2],
+                    'RE_start': re_start,
+                    'Post-AB Bases': (int(new_bases[0]), int(new_bases[1]), int(new_bases[2])),
+                    'Post-AB Outs': new_outs,
+                    'RE_end': re_end,
+                    'Runs_Scored': runs,
+                    'Event Outcome': outcome,
+                    'Run_Value_RE24': run_value_re24,
+                    'prev_batter_wOBA': prev_player.woba if prev_player else 0.320,
+                    'prev_batter_OBP': prev_player.obp if prev_player else 0.320,
+                    'prev_batter_SLG': prev_player.slg if prev_player else 0.400,
+                    'prev_outcome': prev_outcome,
+                    'batter_wOBA': player.woba,
+                    'batter_OBP': player.obp,
+                    'batter_SLG': player.slg,
+                    'batter_xwOBA': player.xwoba,
+                    'batter_xBA': player.xba,
+                    'batter_xSLG': player.xslg,
+                    'batter_ISO': player.iso,
+                    'batter_BB_rate': player.walk_rate,
+                    'batter_K_rate': player.strikeout_rate,
+                    'batter_HR_rate': player.hr_rate,
+                    'batter_contact_rate': player.contact_rate
+                }
+                pbp_events.append(event)
+
+                prev_player = player
+                prev_outcome = outcome
+                bases = new_bases
+                outs = new_outs
+                batter_idx += 1
+
+        return total_runs, pbp_events
+
+    def generate_pbp_dataset(self, player_pool: List[PlayerModel], n_games: int = 500) -> pd.DataFrame:
+        """
+        Generate play-by-play (PBP) dataset across random lineups for LSTM/RNN sequence training
+        """
+        print(f"Generating {n_games} games for PBP dataset...")
+        all_events = []
+
+        for g_idx in range(n_games):
+            if (g_idx + 1) % max(1, n_games // 5) == 0 or g_idx == 0:
+                print(f"  Simulated game {g_idx + 1}/{n_games}")
+
+            game_id = f"Game_{g_idx+1:04d}"
+            sub_players = list(np.random.choice(player_pool, size=9, replace=False))
+            lineup = LineupModel(sub_players, self.config_manager)
+
+            _, g_events = self.simulate_game_pbp(lineup, game_id=game_id)
+            all_events.extend(g_events)
+
+        df_pbp = pd.DataFrame(all_events)
+        print(f"Generated PBP dataset with {len(df_pbp)} events.")
+        return df_pbp
+
     def simulate_game(self, lineup: LineupModel, innings: int = None) -> int:
         """
         Simulate a complete game

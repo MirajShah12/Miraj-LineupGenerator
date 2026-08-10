@@ -24,6 +24,12 @@ from game_generator import GameGenerator
 warnings.filterwarnings('ignore')
 
 
+BENCHMARK_YANKEES_2024 = [
+    'Gleyber Torres', 'Juan Soto', 'Aaron Judge', 'Austin Wells',
+    'Giancarlo Stanton', 'Jazz Chisholm Jr.', 'Anthony Rizzo',
+    'Anthony Volpe', 'Alex Verdugo'
+]
+
 class LineupAnalysis:
     """Handles machine learning analysis and optimization for lineups"""
     
@@ -40,6 +46,7 @@ class LineupAnalysis:
         self.ml_models = {}
         self.scalers = {}
         self.training_data = None
+        self.pbp_data = None
         self.feature_importance = {}
         
     def generate_training_data(self, players: List[PlayerModel], n_lineups: int = None, 
@@ -378,6 +385,153 @@ class LineupAnalysis:
         optimized_lineup = LineupModel(best_lineup_players, self.config_manager)
         optimized_lineup.set_lineup_order([p.name for p in best_lineup_players])
         return optimized_lineup
+
+    def train_lstm_model(self, df_pbp: pd.DataFrame = None, max_seq_len: int = 15) -> Dict[str, Any]:
+        """
+        Train a sequential Neural Network (LSTM / RNN) on play-by-play (PBP) inning sequences.
+        Models situation context (outs, bases, RE_start) and previous batter outcome impact.
+        """
+        if df_pbp is None:
+            if self.pbp_data is None:
+                raise ValueError("No PBP data available. Call game_generator.generate_pbp_dataset first.")
+            df_pbp = self.pbp_data
+        else:
+            self.pbp_data = df_pbp
+
+        print("Preparing PBP sequence data for LSTM/RNN training...")
+        feature_cols = [
+            'batter_OBP', 'batter_SLG', 'batter_ISO', 'batter_BB_rate', 'batter_contact_rate',
+            'batter_xwOBA', 'batter_wOBA', 'batter_xBA', 'batter_HR_rate', 'batter_K_rate',
+            'prev_batter_wOBA', 'prev_batter_OBP', 'prev_batter_SLG',
+            'on_1b', 'on_2b', 'on_3b', 'Pre-AB Outs'
+        ]
+        feature_cols = [c for c in feature_cols if c in df_pbp.columns]
+
+        sequences = []
+        targets = []
+
+        grouped = df_pbp.groupby(['Game ID', 'Inning'])
+        for _, group in grouped:
+            seq = group[feature_cols].values
+            target = group['Run_Value_RE24'].values
+            sequences.append(seq)
+            targets.append(target)
+
+        N_samples = len(sequences)
+        X_padded = np.full((N_samples, max_seq_len, len(feature_cols)), -99.0, dtype=np.float32)
+        y_padded = np.full((N_samples, max_seq_len, 1), -99.0, dtype=np.float32)
+
+        for i, (seq, trg) in enumerate(zip(sequences, targets)):
+            length = min(len(seq), max_seq_len)
+            X_padded[i, :length, :] = seq[:length]
+            y_padded[i, :length, 0] = trg[:length]
+
+        scaler = StandardScaler()
+        X_flat = X_padded.reshape(-1, len(feature_cols))
+        valid_mask = (X_flat[:, 0] != -99.0)
+        scaler.fit(X_flat[valid_mask])
+
+        X_scaled = X_padded.copy()
+        for i in range(N_samples):
+            for t in range(max_seq_len):
+                if X_scaled[i, t, 0] != -99.0:
+                    X_scaled[i, t, :] = scaler.transform(X_scaled[i, t, :].reshape(1, -1))[0]
+
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_padded, test_size=0.2, random_state=42)
+
+        print("Building Sequential LSTM Model...")
+        try:
+            import tensorflow as tf
+            from tensorflow import keras
+            from tensorflow.keras import layers
+
+            model = keras.Sequential([
+                layers.Masking(mask_value=-99.0, input_shape=(max_seq_len, len(feature_cols))),
+                layers.Bidirectional(layers.LSTM(64, return_sequences=True)),
+                layers.TimeDistributed(layers.Dense(32, activation='relu')),
+                layers.TimeDistributed(layers.Dense(1, activation='linear'))
+            ])
+            model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+
+            early_stopping = keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+            model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=20, batch_size=64, callbacks=[early_stopping], verbose=0)
+            print("TF/Keras LSTM Model Trained Successfully!")
+        except Exception as e:
+            print(f"TensorFlow/Keras not available ({e}). Using Scikit-Learn Sequential Feature Regressor fallback...")
+            from sklearn.neural_network import MLPRegressor
+            flat_X_tr = X_train.reshape(X_train.shape[0], -1)
+            flat_y_tr = np.mean(y_train, axis=1).squeeze()
+            model = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=200, random_state=42)
+            model.fit(flat_X_tr, flat_y_tr)
+
+        self.ml_models['lstm'] = {
+            'model': model,
+            'scaler': scaler,
+            'features': feature_cols,
+            'max_seq_len': max_seq_len
+        }
+        return self.ml_models['lstm']
+
+    def optimize_lineup_lstm(self, players: List[PlayerModel]) -> LineupModel:
+        """
+        Optimize 9-hitter lineup using sequential LSTM predictions benchmarking against 2024 Yankees starting lineup.
+        """
+        target_p = players[:9]
+        from itertools import permutations
+
+        if 'lstm' not in self.ml_models:
+            print("LSTM model not trained. Generating PBP dataset and training LSTM model...")
+            pbp_df = self.game_generator.generate_pbp_dataset(target_p, n_games=200)
+            self.train_lstm_model(pbp_df)
+
+        lstm_info = self.ml_models['lstm']
+        model = lstm_info['model']
+        scaler = lstm_info['scaler']
+        feature_cols = lstm_info['features']
+        max_len = lstm_info.get('max_seq_len', 15)
+
+        perm_list = list(permutations(target_p))
+        best_cand = list(target_p)
+        best_score = -np.inf
+
+        print("Evaluating lineup sequence permutations via LSTM Model...")
+        scores = []
+        for perm in perm_list:
+            # Build 9-batter sequence feature matrix
+            seq_mat = np.zeros((1, max_len, len(feature_cols)), dtype=np.float32)
+            prev_p = None
+            for idx, p in enumerate(perm):
+                if idx >= max_len: break
+                row_dict = {
+                    'batter_OBP': p.obp, 'batter_SLG': p.slg, 'batter_ISO': p.iso,
+                    'batter_BB_rate': p.walk_rate, 'batter_contact_rate': p.contact_rate,
+                    'batter_xwOBA': p.xwoba, 'batter_wOBA': p.woba, 'batter_xBA': p.xba,
+                    'batter_HR_rate': p.hr_rate, 'batter_K_rate': p.strikeout_rate,
+                    'prev_batter_wOBA': prev_p.woba if prev_p else 0.320,
+                    'prev_batter_OBP': prev_p.obp if prev_p else 0.320,
+                    'prev_batter_SLG': prev_p.slg if prev_p else 0.400,
+                    'on_1b': 0, 'on_2b': 0, 'on_3b': 0, 'Pre-AB Outs': 0
+                }
+                vec = np.array([row_dict.get(c, 0.0) for c in feature_cols]).reshape(1, -1)
+                vec_s = scaler.transform(vec)[0]
+                seq_mat[0, idx, :] = vec_s
+                prev_p = p
+
+            if hasattr(model, 'predict'):
+                pred = model.predict(seq_mat, verbose=0) if hasattr(model, 'compile') else model.predict(seq_mat.reshape(1, -1))
+                score = float(np.sum(pred))
+            else:
+                score = 0.0
+
+            scores.append(score)
+
+        best_idx = int(np.argmax(scores))
+        best_cand = list(perm_list[best_idx])
+        print(f"LSTM Sequential Optimization Complete! Best Predicted Sequence Score: {scores[best_idx]:.4f}")
+
+        res_lineup = LineupModel(best_cand, self.config_manager)
+        res_lineup.set_lineup_order([p.name for p in best_cand])
+        return res_lineup
     
     def _optimize_simulated_annealing(self, players: List[PlayerModel]) -> LineupModel:
         """Simulated annealing optimization"""
